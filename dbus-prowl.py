@@ -5,24 +5,25 @@ import configparser
 import requests
 import os
 import os.path
+try:
+    from pid import PidFile
+except:
+    print("pid module not found, required to prevent multiple simultaneous instances.")
+    exit(1)
 import platform
 
-from gi.repository import Gio, GLib
-
-#
-# TODO:
-# * as "forward all"
-# error handling from prowl api
-# rate limiting
-#
-
+try:
+    from gi.repository import Gio, GLib
+except:
+    print("python gi (gobject-introspection) module not found, required to monitor dbus.")
+    exit(1)
 
 args=None
 kProwlAPIBase='https://api.prowlapp.com/publicapi/'
 kDbusProwlConfigFile=os.path.expanduser("~/.config/dbus-prowl/config.ini")
 
 def should_forward_notification(msg):
-    if len(args.application) == 0:
+    if "*" in args.application:
         return True
     if msg.get_arg0() and msg.get_arg0().lower() in args.application:
         return True
@@ -55,52 +56,86 @@ def msg_flt(bus, msg, incoming, userdata, unknown):
         print("msg.get_arg0: " + str(msg.get_arg0()))
     if should_forward_notification(msg):
         forward_notification(msg)
+    # the dbus monitor code includes this comment:
+    # /* Monitors must not allow libdbus to reply to messages, so we eat
+    #  * the message. See bug 1719.
+    #  */
+    # so we do the same.
     if incoming:
         return Gio.DBusMessage()
     else:
         return msg
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(description="Forward desktop notifications to Prowl.")
-    parser.add_argument('-n', '--simulate', action='store_true', help='dry-run, no actual prowl api calls')
-    parser.add_argument('-d', '--debug', action='store_true', help='emit debug level spew')
-    parser.add_argument('-a', '--application', default=[], action='append', 
+    parser.add_argument('-n', '--simulate', action='store_true', default=False,
+        help='dry-run, no actual prowl api calls')
+    parser.add_argument('-d', '--debug', action='store_true', default=False,
+        help='emit debug level spew')
+    parser.add_argument('-a', '--application', default=[], action='append',
         help='forward notifications from application')
-    parser.add_argument('-k', '--apikey', type=str, help='Prowl API key')
-    parser.add_argument('--save', action='store_true', help='persist app list and api key as defaults' )
-    args = parser.parse_args()
+    parser.add_argument('-k', '--apikey', type=str, default="",
+        help='Prowl API key - create at https://www.prowlapp.com/api_settings.php')
+    parser.add_argument('--update-defaults', action='store_true',
+        help='update api key if provided and merge app list into defaults')
+    parser.add_argument('--set-defaults', action='store_true',
+        help='store provided api key and application list as defaults')
+    parser.add_argument('--print-config', action='store_true',
+        help='print configured api key and application list')
+    global args; args = parser.parse_args()
 
     os.makedirs(os.path.dirname(kDbusProwlConfigFile), exist_ok=True)
     config = configparser.ConfigParser()
     try:
         config.read(kDbusProwlConfigFile)
-        if len(config['authentication']['apikey']) and not args.apikey:
-            args.apikey = config['authentication']['apikey']
-
-        for key in config['applications']:
-            if config['applications'][key] == 'forward' and key not in args.application:
-                args.application.append(key)
     except FileNotFoundError:
         pass
 
-    if args.save:
+    if args.set_defaults:
+        if not len(args.apikey):
+            raise(ValueError("apikey must be specified to --set-defaults"))
+        config['authentication'] = {}
+        config['applications'] = {}
+    else:
+        if not args.apikey and len(config['authentication']['apikey']):
+            args.apikey = config['authentication']['apikey']
+
+        for key in config['applications']:
+            if key not in args.application and config['applications'][key] == 'forward':
+                args.application.append(key)
+
+    if args.update_defaults or args.set_defaults:
         if len(args.apikey):
-            config['authentication'] = {}
             config['authentication']['apikey'] = args.apikey
         if len(args.application):
-            config['applications'] = {} 
             for app in args.application:
-                config['applications'][app] = 'forward'
+                if app not in config['applications']:
+                    config['applications'][app] = 'forward'
         with open(kDbusProwlConfigFile, 'w') as configfile:
             config.write(configfile)
+            print("defaults saved...")
+
+    if args.print_config:
+        print("configuration:")
+        print("api key: " + args.apikey)
+        print("notifications will be forwarded for the following applications:")
+        for application in args.application:
+            print( "    " + application)
 
     args.application = [x.lower() for x in args.application]
+    # get the session bus singleton
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    # add our message filter
     bus.add_filter(msg_flt, None, None)
+    # become a bus monitor
     bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", 
              "org.freedesktop.DBus.Monitoring", "BecomeMonitor",
              GLib.Variant("(asu)", 
-                          ((["type=method_call,interface=org.freedesktop.Notifications,member=Notify"],0))),
+                ((["type=method_call,interface=org.freedesktop.Notifications,member=Notify"],0))),
              None,
              Gio.DBusCallFlags.NONE, -1, None)
     GLib.MainLoop().run()
+
+if __name__ == '__main__':
+    with PidFile(force_tmpdir=True) as p:
+        main()
