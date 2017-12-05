@@ -2,11 +2,12 @@
 
 import argparse
 import configparser
+import logging
 import requests
 import os
 import os.path
 try:
-    from pid import PidFile
+    from pid import PidFile, PidFileError
 except:
     print("pid module not found, required to prevent multiple simultaneous instances.")
     exit(1)
@@ -22,11 +23,18 @@ args=None
 kProwlAPIBase='https://api.prowlapp.com/publicapi/'
 kDbusProwlConfigFile=os.path.expanduser("~/.config/dbus-prowl/config.ini")
 
+logger = logging.getLogger('dbus-prowl')
+
+def is_notification(msg):
+    return msg.get_message_type() == Gio.DBusMessageType.METHOD_CALL
+
 def should_forward_notification(msg):
     if "*" in args.application:
         return True
     if msg.get_arg0() and msg.get_arg0().lower() in args.application:
+        logger.info("forwarding notification from application '%s'" % msg.get_arg0())
         return True
+    logger.info("not forwarding notification from application '%s'" % msg.get_arg0())
     return False
 
 def forward_notification(msg):
@@ -53,8 +61,7 @@ def msg_flt(bus, msg, incoming, userdata, unknown):
         print("userdata: " + str(userdata))
         print("unknown:  " + str(unknown))
         print(msg.print_(1))
-        print("msg.get_arg0: " + str(msg.get_arg0()))
-    if should_forward_notification(msg):
+    if incoming and is_notification(msg) and should_forward_notification(msg):
         forward_notification(msg)
     # the dbus monitor code includes this comment:
     # /* Monitors must not allow libdbus to reply to messages, so we eat
@@ -83,6 +90,13 @@ def main():
     parser.add_argument('--print-config', action='store_true',
         help='print configured api key and application list')
     global args; args = parser.parse_args()
+
+    logfmt = '%(asctime)s %(name)s %(levelname)s %(message)s'
+    loglevel = logging.INFO
+    if args.debug:
+        loglevel = logging.DEBUG
+    logging.basicConfig(format=logfmt, level=loglevel)
+    logger.setLevel(loglevel)
 
     os.makedirs(os.path.dirname(kDbusProwlConfigFile), exist_ok=True)
     config = configparser.ConfigParser()
@@ -113,7 +127,7 @@ def main():
                     config['applications'][app] = 'forward'
         with open(kDbusProwlConfigFile, 'w') as configfile:
             config.write(configfile)
-            print("defaults saved...")
+            logger.info("defaults saved...")
 
     if args.print_config:
         print("configuration:")
@@ -128,14 +142,20 @@ def main():
     # add our message filter
     bus.add_filter(msg_flt, None, None)
     # become a bus monitor
+    logger.debug("becoming dbus monitor")
     bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", 
              "org.freedesktop.DBus.Monitoring", "BecomeMonitor",
              GLib.Variant("(asu)", 
                 ((["type=method_call,interface=org.freedesktop.Notifications,member=Notify"],0))),
              None,
              Gio.DBusCallFlags.NONE, -1, None)
+    logger.debug("entering glib mainloop")
     GLib.MainLoop().run()
 
 if __name__ == '__main__':
-    with PidFile(force_tmpdir=True) as p:
-        main()
+    try:
+        with PidFile(force_tmpdir=True) as p:
+            main()
+    except PidFileError:
+        logger.error("couldn't create pid/lock file - is another instance already running?")
+        exit(1)
